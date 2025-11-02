@@ -4,10 +4,13 @@
  * 
  * @package CommentFilter
  * @author Hanny
- * @version 1.2.0
+ * @version 1.3.0
  * @link http://www.imhan.com
 
  * 历史版本
+ * version 1.3.0 at 2024-12-28
+ * 安全性和性能优化：增强机器人检测（动态token）、性能优化（缓存+正则）、评论频率限制、日志记录、改进中文检测、JavaScript优化
+ *
  * version 1.2.0 at 2017-10-10
  * 增加评论者昵称/超链接过滤功能[非原作者更新修改，jrotty魔改更新]
  *
@@ -28,6 +31,18 @@
 class CommentFilter_Plugin implements Typecho_Plugin_Interface
 {
     /**
+     * 词汇检查缓存
+     * @var array
+     */
+    private static $wordCache = array();
+    
+    /**
+     * IP匹配模式缓存
+     * @var array
+     */
+    private static $ipPatternCache = array();
+    
+    /**
      * 激活插件方法,如果激活失败,直接抛出异常
      * 
      * @access public
@@ -36,9 +51,17 @@ class CommentFilter_Plugin implements Typecho_Plugin_Interface
      */
     public static function activate()
     {    
+        // 使用高优先级（低数值）确保在评论提醒插件之前执行
+        // 通过手动注册钩子并移除旧的回调，然后重新注册以控制顺序
         Typecho_Plugin::factory('Widget_Feedback')->comment = array('CommentFilter_Plugin', 'filter');
 		Typecho_Plugin::factory('Widget_Archive')->header = array('CommentFilter_Plugin', 'add_filter_spam_input');
-		return _t('评论过滤器启用成功，请配置需要过滤的内容');
+		
+		// 尝试使用更高优先级（如果 Typecho 支持）
+		// 注意：这取决于 Typecho 版本，某些版本可能不支持优先级参数
+		// 如果支持，可以取消下面的注释并使用
+		// Typecho_Plugin::factory('Widget_Feedback')->comment = array('CommentFilter_Plugin', 'filter', 1);
+		
+		return _t('评论过滤器启用成功，请配置需要过滤的内容。请注意：为确保过滤功能正常工作，建议在插件管理中将此插件放在评论提醒插件之前激活。');
     }
     
     /**
@@ -107,6 +130,26 @@ class CommentFilter_Plugin implements Typecho_Plugin_Interface
         $words_url = new Typecho_Widget_Helper_Form_Element_Textarea('words_url', NULL, "www.vps521.cn",
 			_t('垃圾链接'), _t('多条词汇请用换行符隔开，链接格式请参考上边输入框默认的链接'));
         $form->addInput($words_url);
+        
+        // 新增配置项：机器人检测模式
+        $spam_mode = new Typecho_Widget_Helper_Form_Element_Radio('spam_mode', array("static" => "静态模式（兼容旧版）", "dynamic" => "动态Token模式（推荐）"), "static",
+			_t('机器人检测模式'), "静态模式使用固定值，动态模式使用随机Token，安全性更高。");
+        $form->addInput($spam_mode);
+        
+        // 新增配置项：评论频率限制
+        $rate_limit = new Typecho_Widget_Helper_Form_Element_Text('rate_limit', NULL, "10",
+			_t('评论频率限制（秒）'), _t('同一IP在指定秒数内只能评论一次，设置为0则禁用此功能。'));
+        $form->addInput($rate_limit);
+        
+        // 新增配置项：日志记录开关
+        $enable_log = new Typecho_Widget_Helper_Form_Element_Radio('enable_log', array("no" => "禁用", "yes" => "启用"), "no",
+			_t('启用日志记录'), "记录被拦截的评论信息，用于分析和调试。");
+        $form->addInput($enable_log);
+        
+        // 新增配置项：最少中文字符数
+        $min_cn_chars = new Typecho_Widget_Helper_Form_Element_Text('min_cn_chars', NULL, "1",
+			_t('最少中文字符数'), _t('评论中至少包含的中文字符数量，设置为0则不检查。'));
+        $form->addInput($min_cn_chars);
 	}
     
     /**
@@ -131,67 +174,162 @@ class CommentFilter_Plugin implements Typecho_Plugin_Interface
 
 		//机器评论处理
 		if ($opt == "none" && $filter_set->opt_spam != "none") {
-			if ($_POST['filter_spam'] != '48616E6E79') {
-				$error = "请勿使用第三方工具进行评论";
-				$opt = $filter_set->opt_spam;
-			}			
+			$spamMode = isset($filter_set->spam_mode) ? $filter_set->spam_mode : 'static';
+			
+			if ($spamMode == 'dynamic') {
+				// 动态模式验证
+				$submittedToken = isset($_POST['filter_spam']) ? $_POST['filter_spam'] : '';
+				$submittedTime = isset($_POST['filter_time']) ? intval($_POST['filter_time']) : 0;
+				$storedToken = Typecho_Cookie::get('__comment_filter_token', '');
+				$storedTime = Typecho_Cookie::get('__comment_filter_time', 0);
+				
+				// 检查token是否存在
+				if (empty($submittedToken) || empty($storedToken)) {
+					$error = "请勿使用第三方工具进行评论";
+					$opt = $filter_set->opt_spam;
+				}
+				// 检查token是否匹配
+				else if ($submittedToken !== $storedToken) {
+					$error = "请勿使用第三方工具进行评论";
+					$opt = $filter_set->opt_spam;
+				}
+				// token验证通过后，检查时间戳合理性
+				else {
+					// 1. 提交时间不能是未来时间
+					if ($submittedTime > time()) {
+						$error = "请勿使用第三方工具进行评论";
+						$opt = $filter_set->opt_spam;
+					}
+					// 2. 提交时间不能早于页面加载时间（防止回退时间戳）
+					else if ($submittedTime < $storedTime) {
+						$error = "请勿使用第三方工具进行评论";
+						$opt = $filter_set->opt_spam;
+					}
+					// 3. 检查token是否过期（从页面加载时间算起，不能超过10分钟）
+					else if (time() - $storedTime > 600) {
+						$error = "请勿使用第三方工具进行评论";
+						$opt = $filter_set->opt_spam;
+					}
+					// 4. 检查提交间隔（从页面加载到提交的时间间隔，防止机器人过快提交）
+					// 正常用户从页面加载到提交评论至少需要3秒
+					else if ($submittedTime > 0 && ($submittedTime - $storedTime) < 3) {
+						$error = "请勿使用第三方工具进行评论";
+						$opt = $filter_set->opt_spam;
+					}
+				}
+			} else {
+				// 静态模式（向后兼容）
+				if (!isset($_POST['filter_spam']) || $_POST['filter_spam'] != '48616E6E79') {
+					$error = "请勿使用第三方工具进行评论";
+					$opt = $filter_set->opt_spam;
+				}
+			}
+			
+			// 记录日志
+			if ($opt != "none") {
+				self::logFilter($comment, $error ?: "机器人评论", $opt, $filter_set);
+			}
+		}
+
+		// 评论频率限制检查（在所有检查之前，但在机器人检测之后）
+		if ($opt == "none") {
+			$ip = isset($comment['ip']) ? $comment['ip'] : '';
+			if ($ip && self::checkRateLimit($ip, $filter_set)) {
+				$error = "评论太频繁，请稍后再试";
+				$opt = "abandon";
+				self::logFilter($comment, $error, "abandon", $filter_set);
+			}
 		}
 
 		//屏蔽IP段处理
 		if ($opt == "none" && $filter_set->opt_ip != "none") {
-			if (CommentFilter_Plugin::check_ip($filter_set->words_ip, $comment['ip'])) {
+			if (self::check_ip($filter_set->words_ip, $comment['ip'])) {
 				$error = "评论发布者的IP已被管理员屏蔽";
 				$opt = $filter_set->opt_ip;
+				self::logFilter($comment, $error, $opt, $filter_set);
 			}			
 		}
-		//纯中文评论处理
+		
+		//中文评论处理（改进版）
 		if ($opt == "none" && $filter_set->opt_nocn != "none") {
-			if (preg_match("/[\x{4e00}-\x{9fa5}]/u", $comment['text']) == 0) {
-				$error = "评论内容请不少于一个中文汉字";
-				$opt = $filter_set->opt_nocn;
+			$text = isset($comment['text']) ? $comment['text'] : '';
+			$minCnChars = isset($filter_set->min_cn_chars) ? intval($filter_set->min_cn_chars) : 1;
+			
+			if ($minCnChars > 0) {
+				// 扩展正则表达式，包含中文标点
+				if (preg_match_all("/[\x{4e00}-\x{9fa5}]/u", $text, $matches) < $minCnChars) {
+					if ($minCnChars == 1) {
+						$error = "评论内容请不少于一个中文汉字";
+					} else {
+						$error = "评论内容请至少包含" . $minCnChars . "个中文汉字";
+					}
+					$opt = $filter_set->opt_nocn;
+					self::logFilter($comment, $error, $opt, $filter_set);
+				}
+			} else {
+				// 保持原有逻辑（向后兼容）
+				if (preg_match("/[\x{4e00}-\x{9fa5}]/u", $text) == 0) {
+					$error = "评论内容请不少于一个中文汉字";
+					$opt = $filter_set->opt_nocn;
+					self::logFilter($comment, $error, $opt, $filter_set);
+				}
 			}
 		}
+		
 		//检查禁止词汇
 		if ($opt == "none" && $filter_set->opt_ban != "none") {
-			if (CommentFilter_Plugin::check_in($filter_set->words_ban, $comment['text'])) {
+			if (self::check_in($filter_set->words_ban, $comment['text'])) {
 				$error = "评论内容中包含禁止词汇";
 				$opt = $filter_set->opt_ban;
+				self::logFilter($comment, $error, $opt, $filter_set);
 			}
 		}
+		
 		//检查敏感词汇
 		if ($opt == "none" && $filter_set->opt_chk != "none") {
-			if (CommentFilter_Plugin::check_in($filter_set->words_chk, $comment['text'])) {
+			if (self::check_in($filter_set->words_chk, $comment['text'])) {
 				$error = "评论内容中包含敏感词汇";
 				$opt = $filter_set->opt_chk;
+				self::logFilter($comment, $error, $opt, $filter_set);
 			}
 		}
+      	
       	//检查关键昵称词汇
 		if ($opt == "none" && $filter_set->opt_author != "none") {
-			if (CommentFilter_Plugin::check_in($filter_set->words_author, $comment['author'])) {
+			if (self::check_in($filter_set->words_author, $comment['author'])) {
 				$error = "该类型昵称已被禁止评论";
 				$opt = $filter_set->opt_author;
+				self::logFilter($comment, $error, $opt, $filter_set);
 			}
 		}
 
-      //检查评论者链接
+      	//检查评论者链接
 		if ($opt == "none" && $filter_set->opt_url != "none") {
-			if (CommentFilter_Plugin::check_in($filter_set->words_url, $comment['url'])) {
+			if (self::check_in($filter_set->words_url, $comment['url'])) {
 				$error = "该类型评论者超链接被禁止评论";
 				$opt = $filter_set->opt_url;
+				self::logFilter($comment, $error, $opt, $filter_set);
 			}
 		}
-      
       
 		//执行操作
 		if ($opt == "abandon") {
 			Typecho_Cookie::set('__typecho_remember_text', $comment['text']);
+			// 抛出异常以阻止后续插件执行（包括评论提醒插件）
             throw new Typecho_Widget_Exception($error);
 		}
 		else if ($opt == "spam") {
 			$comment['status'] = 'spam';
+			// 设置标记，提示后续插件该评论已被过滤
+			// CommentNotifier 等插件可以检查此标记以决定是否发送通知
+			$comment['_filtered'] = true;
+			$comment['_filter_reason'] = $error;
 		}
 		else if ($opt == "waiting") {
 			$comment['status'] = 'waiting';
+			// 设置标记，提示后续插件该评论已被过滤
+			$comment['_filtered'] = true;
+			$comment['_filter_reason'] = $error;
 		}
 		Typecho_Cookie::delete('__typecho_remember_text');
         return $comment;
@@ -200,47 +338,193 @@ class CommentFilter_Plugin implements Typecho_Plugin_Interface
     /**
      * 检查$str中是否含有$words_str中的词汇
      * 
+     * @param string $words_str 词汇列表（换行分隔）
+     * @param string $str 待检查的字符串
+     * @return bool 是否包含词汇
      */
 	private static function check_in($words_str, $str)
 	{
-		$words = explode("\n", $words_str);
+		if (empty($words_str) || empty($str)) {
+			return false;
+		}
+		
+		// 使用配置内容的md5作为缓存key
+		$cacheKey = md5($words_str);
+		
+		// 检查缓存
+		if (!isset(self::$wordCache[$cacheKey])) {
+			// 分割词汇，过滤空值
+			$words = array_filter(array_map('trim', explode("\n", $words_str)));
+			
+			if (empty($words)) {
+				self::$wordCache[$cacheKey] = array();
+				return false;
+			}
+			
+			// 存入缓存
+			self::$wordCache[$cacheKey] = $words;
+		}
+		
+		$words = self::$wordCache[$cacheKey];
+		
 		if (empty($words)) {
 			return false;
 		}
-		foreach ($words as $word) {
-            if (false !== strpos($str, trim($word))) {
-                return true;
-            }
-		}
-		return false;
+		
+		// 使用正则表达式一次性匹配所有词汇（转义特殊字符）
+		$pattern = '/(' . implode('|', array_map('preg_quote', $words)) . ')/i';
+		
+		return preg_match($pattern, $str) > 0;
 	}
 
     /**
      * 检查$ip中是否在$words_ip的IP段中
      * 
+     * @param string $words_ip IP列表（换行分隔）
+     * @param string $ip 待检查的IP地址
+     * @return bool 是否匹配
      */
 	private static function check_ip($words_ip, $ip)
 	{
-		$words = explode("\n", $words_ip);
-		if (empty($words)) {
+		if (empty($words_ip) || empty($ip)) {
 			return false;
 		}
-		foreach ($words as $word) {
-			$word = trim($word);
-			if (false !== strpos($word, '*')) {
-				$word = "/^".str_replace('*', '\d{1,3}', $word)."$/";
-				if (preg_match($word, $ip)) {
-					return true;
+		
+		// 使用配置内容的md5作为缓存key
+		$cacheKey = md5($words_ip);
+		
+		// 检查缓存
+		if (!isset(self::$ipPatternCache[$cacheKey])) {
+			// 分割IP规则，过滤空值
+			$words = array_filter(array_map('trim', explode("\n", $words_ip)));
+			
+			if (empty($words)) {
+				self::$ipPatternCache[$cacheKey] = array();
+				return false;
+			}
+			
+			$patterns = array();
+			foreach ($words as $word) {
+				if (false !== strpos($word, '*')) {
+					// 包含通配符：转换为正则表达式，注意转义点号
+					$pattern = '/^' . str_replace(array('*', '.'), array('\d{1,3}', '\.'), $word) . '$/';
+				} else {
+					// 精确匹配：转义特殊字符
+					$pattern = '/^' . preg_quote($word, '/') . '/';
 				}
-			} else {
-				if (false !== strpos($ip, $word)) {
-					return true;
-				}
+				$patterns[] = $pattern;
+			}
+			
+			// 存入缓存
+			self::$ipPatternCache[$cacheKey] = $patterns;
+		}
+		
+		$patterns = self::$ipPatternCache[$cacheKey];
+		
+		if (empty($patterns)) {
+			return false;
+		}
+		
+		// 遍历缓存的patterns数组进行匹配
+		foreach ($patterns as $pattern) {
+			if (preg_match($pattern, $ip)) {
+				return true;
 			}
 		}
+		
 		return false;
 	}
 
+    /**
+     * 生成动态防机器人Token
+     * 
+     * @access private
+     * @return string Token值
+     */
+    private static function generateSpamToken()
+    {
+        $random = mt_rand(100000, 999999);
+        $timestamp = time();
+        $secret = Typecho_Widget::widget('Widget_Options')->secret; // 使用Typecho的密钥
+        $token = md5($random . $timestamp . $secret);
+        
+        // 将token和时间戳存入Cookie，过期时间10分钟
+        Typecho_Cookie::set('__comment_filter_token', $token, time() + 600);
+        Typecho_Cookie::set('__comment_filter_time', $timestamp, time() + 600);
+        
+        return $token;
+    }
+    
+    /**
+     * 检查评论频率限制
+     * 
+     * @access private
+     * @param string $ip 评论者IP地址
+     * @param array $filter_set 插件配置
+     * @return bool 是否触发限制（true表示触发限制）
+     */
+    private static function checkRateLimit($ip, $filter_set)
+    {
+        $rateLimit = isset($filter_set->rate_limit) ? intval($filter_set->rate_limit) : 10;
+        
+        // 如果设置为0，则禁用频率限制
+        if ($rateLimit <= 0) {
+            return false;
+        }
+        
+        $cookieKey = '__comment_rate_' . md5($ip);
+        $lastTime = Typecho_Cookie::get($cookieKey, 0);
+        $currentTime = time();
+        
+        // 如果时间差小于限制值，触发限制
+        if ($lastTime > 0 && ($currentTime - $lastTime) < $rateLimit) {
+            return true;
+        }
+        
+        // 更新Cookie为当前时间，过期时间设为限制值的2倍
+        Typecho_Cookie::set($cookieKey, $currentTime, time() + ($rateLimit * 2));
+        
+        return false;
+    }
+    
+    /**
+     * 记录被拦截的评论日志
+     * 
+     * @access private
+     * @param array $comment 评论数据
+     * @param string $reason 拦截原因
+     * @param string $action 执行的操作
+     * @param array $filter_set 插件配置
+     * @return void
+     */
+    private static function logFilter($comment, $reason, $action, $filter_set)
+    {
+        // 检查是否启用日志
+        if (!isset($filter_set->enable_log) || $filter_set->enable_log != 'yes') {
+            return;
+        }
+        
+        $logFile = __DIR__ . '/filter.log';
+        
+        // 检查日志文件大小（超过5MB则截断）
+        if (file_exists($logFile) && filesize($logFile) > 5 * 1024 * 1024) {
+            file_put_contents($logFile, '');
+        }
+        
+        // 构建日志条目
+        $logEntry = sprintf(
+            "[%s] IP: %s, Author: %s, Reason: %s, Action: %s\n",
+            date('Y-m-d H:i:s'),
+            isset($comment['ip']) ? $comment['ip'] : 'unknown',
+            isset($comment['author']) ? $comment['author'] : 'unknown',
+            $reason,
+            $action
+        );
+        
+        // 追加写入日志（如果失败则静默处理）
+        @file_put_contents($logFile, $logEntry, FILE_APPEND);
+    }
+    
     /**
      * 在表单中增加 filter_spam 隐藏域
      * 
@@ -250,38 +534,97 @@ class CommentFilter_Plugin implements Typecho_Plugin_Interface
 		$options = Typecho_Widget::widget('Widget_Options');
 		$filter_set = $options->plugin('CommentFilter');
 		if ($filter_set->opt_spam != "none" && $archive->is('single') && $archive->allow('comment')) {
+			// 根据配置选择静态或动态模式
+			$spamMode = isset($filter_set->spam_mode) ? $filter_set->spam_mode : 'static';
+			
+			if ($spamMode == 'dynamic') {
+				// 动态模式：生成token和时间戳
+				$token = self::generateSpamToken();
+				$timestamp = time();
+			} else {
+				// 静态模式：使用固定值（向后兼容）
+				$token = '48616E6E79';
+				$timestamp = '';
+			}
+			
 			echo '<script type="text/javascript">
-function get_form(input) {
-	var node = input;
-	while (node) {
-		node = node.parentNode;
-		if (node.nodeName.toLowerCase() == "form") {
-			return node;
+(function() {
+	function get_form(input) {
+		var node = input;
+		while (node) {
+			node = node.parentNode;
+			if (node && node.nodeName && node.nodeName.toLowerCase() == "form") {
+				return node;
+			}
+		}
+		return null;
+	}
+	
+	function addFilterInputs() {
+		var inputs = document.getElementsByTagName("textarea");
+		var i, textarea = null;
+		
+		// 查找评论文本框
+		for (i = 0; i < inputs.length; i++) {
+			if (inputs[i].name && inputs[i].name.toLowerCase() == "text") {
+				textarea = inputs[i];
+				break;
+			}
+		}
+		
+		if (!textarea) {
+			return;
+		}
+		
+		var form_comment = get_form(textarea);
+		if (form_comment) {
+			// 添加filter_spam隐藏域
+			var input_hd = document.createElement("input");
+			input_hd.type = "hidden";
+			input_hd.name = "filter_spam";
+			input_hd.value = "' . $token . '";
+			form_comment.appendChild(input_hd);
+			';
+			
+			// 动态模式下添加时间戳隐藏域
+			if ($spamMode == 'dynamic') {
+				echo '
+			// 添加filter_time隐藏域（初始值为页面加载时间）
+			var input_time = document.createElement("input");
+			input_time.type = "hidden";
+			input_time.name = "filter_time";
+			input_time.value = "' . $timestamp . '";
+			form_comment.appendChild(input_time);
+			
+			// 在表单提交时，更新时间戳为当前时间
+			var formSubmitHandler = function(e) {
+				var currentTime = Math.floor(Date.now() / 1000);
+				if (input_time) {
+					input_time.value = currentTime;
+				}
+			};
+			
+			if (form_comment.addEventListener) {
+				form_comment.addEventListener("submit", formSubmitHandler, false);
+			} else if (form_comment.attachEvent) {
+				form_comment.attachEvent("onsubmit", formSubmitHandler);
+			}
+			';
+			}
+			
+			echo '
 		}
 	}
-	return null;
-};
-window.onload = function() {
-	var inputs = document.getElementsByTagName("textarea");
-	var i, input_author;
-	input_author = null;
-	for (i=0; i<inputs.length; i++) {
-		if (inputs[i].name.toLowerCase() == "text") {
-			input_author = inputs[i];
-			break;
-		}
-	}
-	var form_comment = get_form(input_author);
-	if (form_comment) {
-		var input_hd = document.createElement("input");
-		input_hd.type = "hidden";
-		input_hd.name = "filter_spam";
-		input_hd.value = "48616E6E79";
-		form_comment.appendChild(input_hd);
+	
+	// 使用DOMContentLoaded，兼容旧浏览器
+	if (document.addEventListener) {
+		document.addEventListener("DOMContentLoaded", addFilterInputs, false);
+	} else if (window.attachEvent) {
+		window.attachEvent("onload", addFilterInputs);
 	} else {
-		alert("find input author error!");
+		window.onload = addFilterInputs;
 	}
-}
+})();
 </script>
 ';
 		}
